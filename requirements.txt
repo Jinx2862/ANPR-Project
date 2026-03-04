@@ -1,0 +1,9 @@
+ultralytics 
+opencv-python 
+easyocr 
+torch 
+torchvision
+numpy
+scipy.interpolate
+matplotlib
+pandas
