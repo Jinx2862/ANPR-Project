@@ -13,7 +13,7 @@ from ultralytics import YOLO
 # ===============================
 # Load Models
 # ===============================
-model = YOLO("yolo26n.pt")
+model = YOLO("best.pt")
 reader = easyocr.Reader(['en'])
 
 cap = cv2.VideoCapture("sample_video.mp4")

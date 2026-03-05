@@ -11,8 +11,8 @@ import easyocr
 # ===============================
 MODEL_PATH = "best.pt"
 INPUT_FOLDER = "new_images"
-OUTPUT_FOLDER = "final_output_1"
-CSV_NAME = "final_results_1.csv"
+OUTPUT_FOLDER = "final_output_Images"
+CSV_NAME = "final_results.csv"
 DETECTION_CONF = 0.10 # Lowered further for recalcitrant plates
 
 # ===============================
