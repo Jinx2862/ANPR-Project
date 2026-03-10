@@ -1,45 +1,43 @@
-# ============================================
-# IMPORT REQUIRED LIBRARIES
-# ============================================
+# ==========================================================
+# IMPORT LIBRARIES
+# ==========================================================
 
-import cv2                         # OpenCV for video processing
-import time                        # Used for FPS calculation
-import pandas as pd                # Used for saving plate data to CSV
-import re                          # Regex for plate pattern matching
-from ultralytics import YOLO       # YOLO object detection model
-import easyocr                     # OCR engine
+import cv2                     # OpenCV for video capture and drawing
+import time                    # Used for FPS calculation
+import pandas as pd            # Used for logging plates to CSV
+import re                      # Used for plate pattern matching
+from collections import Counter  # Used for majority voting
+from ultralytics import YOLO   # YOLO detection model
+import easyocr                 # OCR engine
 from deep_sort_realtime.deepsort_tracker import DeepSort  # Tracking
 
 
-# ============================================
-# CONFIGURATION PARAMETERS
-# ============================================
+# ==========================================================
+# CONFIGURATION
+# ==========================================================
 
-MODEL_PATH = "best.pt"                 # Path to trained YOLO model
-CSV_FILE = "detected_plates.csv"       # Output CSV file
-DETECTION_CONF = 0.30                  # Minimum YOLO confidence
-FRAME_SKIP = 3                         # Skip frames for CPU optimization
+MODEL_PATH = "best.pt"             # YOLO model path
+CSV_FILE = "detected_plates.csv"   # CSV output file
+DETECTION_CONF = 0.30              # YOLO confidence threshold
+FRAME_SKIP = 3                     # Skip frames for speed
+OCR_BUFFER_SIZE = 5                # Frames used for majority voting
 
 
-# ============================================
+# ==========================================================
 # LOAD MODELS
-# ============================================
+# ==========================================================
 
-# Load YOLO model
-model = YOLO(MODEL_PATH)
+model = YOLO(MODEL_PATH)           # Load YOLO model
 
-# Initialize OCR reader (English characters)
-reader = easyocr.Reader(['en'], gpu=False)
+reader = easyocr.Reader(['en'], gpu=False)  # Initialize OCR
 
-# Initialize DeepSORT tracker
-tracker = DeepSort(max_age=30)
+tracker = DeepSort(max_age=30)     # Initialize DeepSORT tracker
 
 
-# ============================================
-# INDIAN NUMBER PLATE DATA
-# ============================================
+# ==========================================================
+# INDIAN STATE CODES
+# ==========================================================
 
-# List of valid Indian state codes
 STATE_CODES = [
 'AN','AP','AR','AS','BR','CH','CG','DD','DL','GA','GJ','HR','HP',
 'JK','JH','KA','KL','LA','LD','MP','MH','ML','MZ','NL','OR','OD',
@@ -47,78 +45,63 @@ STATE_CODES = [
 ]
 
 
-# ============================================
-# MEMORY CACHE + VEHICLE COUNT
-# ============================================
+# ==========================================================
+# MEMORY STRUCTURES
+# ==========================================================
 
-# Store already detected plates
-plate_memory = set()
+plate_memory = set()        # Stores plates already logged
+vehicle_count = 0           # Counts vehicles
 
-# Vehicle counter
-vehicle_count = 0
+ocr_buffers = {}            # Stores OCR results per track ID
 
 
-# ============================================
+# ==========================================================
 # CREATE CSV FILE
-# ============================================
+# ==========================================================
 
-# Create CSV with headers
 df = pd.DataFrame(columns=["timestamp", "plate_number", "track_id"])
 df.to_csv(CSV_FILE, index=False)
 
 
-# ============================================
-# TEXT CLEANING FUNCTION
-# ============================================
+# ==========================================================
+# TEXT CLEANING
+# ==========================================================
 
 def clean_plate_text(text):
-    """
-    Removes unwanted characters from OCR output
-    Keeps only letters and numbers.
-    """
 
-    text = text.upper()  # Convert to uppercase
+    text = text.upper()
 
-    # Remove everything except A-Z and 0-9
     text = re.sub(r'[^A-Z0-9]', '', text)
 
     return text
 
 
-# ============================================
-# INDIAN PLATE CORRECTION LOGIC
-# ============================================
+# ==========================================================
+# INDIAN PLATE FORMAT CORRECTION
+# ==========================================================
 
 def correct_indian_plate(text):
-    """
-    Detects and formats Indian plates.
-    Supports:
-    1) State series (MH12AB1234)
-    2) BH series (22BH1234AA)
-    """
 
     if not text or len(text) < 7:
         return ""
 
     text = text.upper()
 
-
-    # ---------------------------------
-    # BH SERIES LOGIC
-    # ---------------------------------
+    # -------------------------
+    # BH SERIES FORMAT
+    # -------------------------
     bh_pattern = re.compile(r'([0-9]{2})BH([0-9]{4})([A-Z]{2})')
 
     match = bh_pattern.search(text)
 
     if match:
         year, number, series = match.groups()
-
         return f"{year}BH{number}{series}"
 
 
-    # ---------------------------------
-    # STATE SERIES LOGIC
-    # ---------------------------------
+    # -------------------------
+    # STATE SERIES FORMAT
+    # -------------------------
     state_pattern = re.compile(
         r'([A-Z]{2})([0-9]{1,2})([A-Z]{1,2})([0-9]{3,4})'
     )
@@ -129,7 +112,6 @@ def correct_indian_plate(text):
 
         state, district, series, number = match.groups()
 
-        # Validate state code
         if state in STATE_CODES:
 
             district = district.zfill(2)
@@ -139,56 +121,60 @@ def correct_indian_plate(text):
     return ""
 
 
-# ============================================
+# ==========================================================
 # OCR FUNCTION
-# ============================================
+# ==========================================================
 
 def read_plate(plate_crop):
-    """
-    Performs OCR and applies Indian plate correction logic.
-    """
 
-    # Run OCR
     results = reader.readtext(plate_crop)
 
     raw_text = ""
 
-    # Combine detected OCR text
     for res in results:
         raw_text += res[1]
 
-    # Step 1: Clean OCR output
-    cleaned_text = clean_plate_text(raw_text)
+    cleaned = clean_plate_text(raw_text)
 
-    # Step 2: Apply Indian correction logic
-    corrected_text = correct_indian_plate(cleaned_text)
+    corrected = correct_indian_plate(cleaned)
 
-    return corrected_text
+    return corrected
 
 
-# ============================================
+# ==========================================================
+# MAJORITY VOTING FUNCTION
+# ==========================================================
+
+def majority_vote(text_list):
+    """
+    Returns most frequent plate from OCR results
+    """
+
+    if len(text_list) == 0:
+        return ""
+
+    counter = Counter(text_list)
+
+    return counter.most_common(1)[0][0]
+
+
+# ==========================================================
 # VIDEO SOURCE
-# ============================================
+# ==========================================================
 
-# Use webcam
 cap = cv2.VideoCapture(0)
-
-# For video file use:
-# cap = cv2.VideoCapture("traffic.mp4")
-
 
 frame_count = 0
 
 start_time = time.time()
 
 
-# ============================================
-# MAIN LOOP
-# ============================================
+# ==========================================================
+# MAIN PROCESSING LOOP
+# ==========================================================
 
 while True:
 
-    # Read frame
     ret, frame = cap.read()
 
     if not ret:
@@ -196,14 +182,14 @@ while True:
 
     frame_count += 1
 
-    # Skip frames to increase speed
+    # Skip frames for performance
     if frame_count % FRAME_SKIP != 0:
         continue
 
 
-    # ======================================
-    # YOLO PLATE DETECTION
-    # ======================================
+    # ======================================================
+    # YOLO LICENSE PLATE DETECTION
+    # ======================================================
 
     results = model(frame, conf=DETECTION_CONF, verbose=False)
 
@@ -217,19 +203,18 @@ while True:
 
         for box, cls, conf in zip(boxes, classes, confs):
 
-            if int(cls) == 0:  # license plate class
+            if int(cls) == 0:
 
                 x1, y1, x2, y2 = map(int, box)
 
                 detections.append(([x1, y1, x2-x1, y2-y1], conf, 'plate'))
 
 
-    # ======================================
+    # ======================================================
     # TRACKING USING DEEPSORT
-    # ======================================
+    # ======================================================
 
     tracks = tracker.update_tracks(detections, frame=frame)
-
 
     for track in tracks:
 
@@ -243,45 +228,68 @@ while True:
         plate_crop = frame[t:t+h, l:l+w]
 
 
-        # ======================================
-        # OCR + INDIAN PLATE LOGIC
-        # ======================================
+        # ======================================================
+        # OCR EXTRACTION
+        # ======================================================
 
         plate_text = read_plate(plate_crop)
 
+        if plate_text == "":
+            continue
 
-        # ======================================
-        # DUPLICATE PLATE FILTER
-        # ======================================
 
-        if plate_text and plate_text not in plate_memory:
+        # ======================================================
+        # OCR MAJORITY VOTING BUFFER
+        # ======================================================
 
-            plate_memory.add(plate_text)
+        if track_id not in ocr_buffers:
+
+            ocr_buffers[track_id] = []
+
+        ocr_buffers[track_id].append(plate_text)
+
+        # Limit buffer size
+        if len(ocr_buffers[track_id]) > OCR_BUFFER_SIZE:
+
+            ocr_buffers[track_id].pop(0)
+
+
+        # Get most frequent OCR result
+        final_plate = majority_vote(ocr_buffers[track_id])
+
+
+        # ======================================================
+        # DUPLICATE FILTER
+        # ======================================================
+
+        if final_plate and final_plate not in plate_memory:
+
+            plate_memory.add(final_plate)
 
             vehicle_count += 1
 
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
             new_row = pd.DataFrame(
-                [[timestamp, plate_text, track_id]],
-                columns=["timestamp", "plate_number", "track_id"]
+                [[timestamp, final_plate, track_id]],
+                columns=["timestamp","plate_number","track_id"]
             )
 
             new_row.to_csv(CSV_FILE, mode='a', header=False, index=False)
 
-            print("Detected:", plate_text)
+            print("Detected Plate:", final_plate)
 
 
-        # ======================================
-        # DRAW RESULTS
-        # ======================================
+        # ======================================================
+        # DRAW BOUNDING BOX
+        # ======================================================
 
-        cv2.rectangle(frame, (l, t), (l+w, t+h), (0,255,0), 2)
+        cv2.rectangle(frame,(l,t),(l+w,t+h),(0,255,0),2)
 
         cv2.putText(
             frame,
-            plate_text,
-            (l, t-10),
+            final_plate,
+            (l,t-10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
             (0,255,0),
@@ -289,9 +297,9 @@ while True:
         )
 
 
-    # ======================================
-    # VEHICLE COUNT DISPLAY
-    # ======================================
+    # ======================================================
+    # DISPLAY VEHICLE COUNT
+    # ======================================================
 
     cv2.putText(
         frame,
@@ -304,9 +312,9 @@ while True:
     )
 
 
-    # ======================================
+    # ======================================================
     # FPS DISPLAY
-    # ======================================
+    # ======================================================
 
     elapsed_time = time.time() - start_time
 
@@ -323,18 +331,20 @@ while True:
     )
 
 
-    # Show video
-    cv2.imshow("Advanced Real-Time ANPR", frame)
+    # ======================================================
+    # SHOW VIDEO WINDOW
+    # ======================================================
 
+    cv2.imshow("Advanced ANPR System", frame)
 
-    # Press Q to exit
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 
-# ============================================
+# ==========================================================
 # CLEANUP
-# ============================================
+# ==========================================================
 
 cap.release()
+
 cv2.destroyAllWindows()
