@@ -159,192 +159,304 @@ def majority_vote(text_list):
 
 
 # ==========================================================
-# VIDEO SOURCE
+# RUN MODE CONFIGURATION
 # ==========================================================
 
-cap = cv2.VideoCapture(0)
-
-frame_count = 0
-
-start_time = time.time()
+# Select the mode you want to run: 'image', 'video', or 'stream'
+RUN_MODE = 'image'
 
 
 # ==========================================================
-# MAIN PROCESSING LOOP
+# 1. IMAGE PROCESSING MODE (FOLDER)
 # ==========================================================
 
-while True:
+if RUN_MODE == 'image':
+    import os
+    import glob
 
-    ret, frame = cap.read()
+    IMAGE_FOLDER = "images"  # Path to the folder containing images
+    
+    if not os.path.exists(IMAGE_FOLDER):
+        print(f"Directory '{IMAGE_FOLDER}' not found. Please create it and add images.")
+    else:
+        # Get all common image formats
+        image_paths = []
+        for ext in ('*.png', '*.jpg', '*.jpeg', '*.PNG', '*.JPG', '*.JPEG'):
+            image_paths.extend(glob.glob(os.path.join(IMAGE_FOLDER, ext)))
+        
+        if not image_paths:
+            print(f"No images found in '{IMAGE_FOLDER}'.")
 
-    if not ret:
-        break
+        for img_path in image_paths:
+            print(f"Processing: {img_path}")
+            frame = cv2.imread(img_path)
+            if frame is None:
+                continue
+            
+            # YOLO LICENSE PLATE DETECTION
+            results = model(frame, conf=DETECTION_CONF, verbose=False)
+            
+            for result in results:
+                boxes = result.boxes.xyxy.cpu().numpy()
+                classes = result.boxes.cls.cpu().numpy()
+                confs = result.boxes.conf.cpu().numpy()
+                
+                for box, cls, conf in zip(boxes, classes, confs):
+                    if int(cls) == 0:  # Assumed 0 is plate
+                        x1, y1, x2, y2 = map(int, box)
+                        
+                        # Ensure coordinates are within frame bounds
+                        x1, y1 = max(0, x1), max(0, y1)
+                        
+                        plate_crop = frame[y1:y2, x1:x2]
+                        if plate_crop.size == 0:
+                            continue
+                        
+                        plate_text = read_plate(plate_crop)
+                        
+                        if plate_text and plate_text not in plate_memory:
+                            plate_memory.add(plate_text)
+                            vehicle_count += 1
+                            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                            
+                            new_row = pd.DataFrame(
+                                [[timestamp, plate_text, "N/A"]],
+                                columns=["timestamp","plate_number","track_id"]
+                            )
+                            new_row.to_csv(CSV_FILE, mode='a', header=False, index=False)
+                            print(f"Detected Plate [{plate_text}] from {img_path}")
 
-    frame_count += 1
 
-    # Skip frames for performance
-    if frame_count % FRAME_SKIP != 0:
-        continue
+# ==========================================================
+# 2. VIDEO PROCESSING MODE (COMMENTED OUT)
+# ==========================================================
+'''
+elif RUN_MODE == 'video':
 
+    VIDEO_PATH = "test_video.mp4"
+    cap = cv2.VideoCapture(VIDEO_PATH)
 
-    # ======================================================
-    # YOLO LICENSE PLATE DETECTION
-    # ======================================================
+    frame_count = 0
+    start_time = time.time()
 
-    results = model(frame, conf=DETECTION_CONF, verbose=False)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    detections = []
-
-    for result in results:
-
-        boxes = result.boxes.xyxy.cpu().numpy()
-        classes = result.boxes.cls.cpu().numpy()
-        confs = result.boxes.conf.cpu().numpy()
-
-        for box, cls, conf in zip(boxes, classes, confs):
-
-            if int(cls) == 0:
-
-                x1, y1, x2, y2 = map(int, box)
-
-                detections.append(([x1, y1, x2-x1, y2-y1], conf, 'plate'))
-
-
-    # ======================================================
-    # TRACKING USING DEEPSORT
-    # ======================================================
-
-    tracks = tracker.update_tracks(detections, frame=frame)
-
-    for track in tracks:
-
-        if not track.is_confirmed():
+        frame_count += 1
+        if frame_count % FRAME_SKIP != 0:
             continue
 
-        track_id = track.track_id
-
-        l, t, w, h = map(int, track.to_ltrb())
-
-        plate_crop = frame[t:t+h, l:l+w]
-
+        # ======================================================
+        # YOLO LICENSE PLATE DETECTION
+        # ======================================================
+        results = model(frame, conf=DETECTION_CONF, verbose=False)
+        detections = []
+        for result in results:
+            boxes = result.boxes.xyxy.cpu().numpy()
+            classes = result.boxes.cls.cpu().numpy()
+            confs = result.boxes.conf.cpu().numpy()
+            for box, cls, conf in zip(boxes, classes, confs):
+                if int(cls) == 0:
+                    x1, y1, x2, y2 = map(int, box)
+                    detections.append(([x1, y1, x2-x1, y2-y1], conf, 'plate'))
 
         # ======================================================
-        # OCR EXTRACTION
+        # TRACKING USING DEEPSORT
         # ======================================================
+        tracks = tracker.update_tracks(detections, frame=frame)
+        for track in tracks:
+            if not track.is_confirmed():
+                continue
 
-        plate_text = read_plate(plate_crop)
+            track_id = track.track_id
+            l, t, w, h = map(int, track.to_ltrb())
+            
+            # Bounds check
+            l, t = max(0, l), max(0, t)
 
-        if plate_text == "":
+            plate_crop = frame[t:t+h, l:l+w]
+            if plate_crop.size == 0:
+                continue
+
+            # ======================================================
+            # OCR EXTRACTION
+            # ======================================================
+            plate_text = read_plate(plate_crop)
+            if not plate_text:
+                continue
+
+            # ======================================================
+            # OCR MAJORITY VOTING BUFFER
+            # ======================================================
+            if track_id not in ocr_buffers:
+                ocr_buffers[track_id] = []
+            ocr_buffers[track_id].append(plate_text)
+
+            if len(ocr_buffers[track_id]) > OCR_BUFFER_SIZE:
+                ocr_buffers[track_id].pop(0)
+
+            final_plate = majority_vote(ocr_buffers[track_id])
+
+            # ======================================================
+            # DUPLICATE FILTER
+            # ======================================================
+            if final_plate and final_plate not in plate_memory:
+                plate_memory.add(final_plate)
+                vehicle_count += 1
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+                new_row = pd.DataFrame(
+                    [[timestamp, final_plate, track_id]],
+                    columns=["timestamp","plate_number","track_id"]
+                )
+                new_row.to_csv(CSV_FILE, mode='a', header=False, index=False)
+                print("Detected Plate:", final_plate)
+
+            # ======================================================
+            # DRAW BOUNDING BOX
+            # ======================================================
+            cv2.rectangle(frame, (l, t), (l+w, t+h), (0, 255, 0), 2)
+            cv2.putText(frame, final_plate, (l, t-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        # ======================================================
+        # DISPLAY STATS & VIDEO
+        # ======================================================
+        cv2.putText(frame, f"Vehicle Count: {vehicle_count}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+
+        elapsed_time = time.time() - start_time
+        fps = frame_count / elapsed_time if elapsed_time > 0 else 0
+        cv2.putText(frame, f"FPS: {fps:.2f}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 3)
+
+        cv2.imshow("Advanced ANPR System - Video", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # ==========================================================
+    # CLEANUP
+    # ==========================================================
+    cap.release()
+    cv2.destroyAllWindows()
+'''
+
+# ==========================================================
+# 3. LIVE STREAMING MODE (COMMENTED OUT)
+# ==========================================================
+'''
+elif RUN_MODE == 'stream':
+
+    # Example IP Camera stream URL or Webcam ID
+    STREAM_URL = "http://192.168.1.100:8080/video" # or 0 for webcam
+    cap = cv2.VideoCapture(STREAM_URL)
+    
+    # Optional setup for lower latency on streams
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    frame_count = 0
+    start_time = time.time()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame. Trying to reconnect...")
+            time.sleep(1)
+            cap.release()
+            cap = cv2.VideoCapture(STREAM_URL)
             continue
 
+        frame_count += 1
+        if frame_count % FRAME_SKIP != 0:
+            continue
 
         # ======================================================
-        # OCR MAJORITY VOTING BUFFER
+        # YOLO LICENSE PLATE DETECTION
         # ======================================================
-
-        if track_id not in ocr_buffers:
-
-            ocr_buffers[track_id] = []
-
-        ocr_buffers[track_id].append(plate_text)
-
-        # Limit buffer size
-        if len(ocr_buffers[track_id]) > OCR_BUFFER_SIZE:
-
-            ocr_buffers[track_id].pop(0)
-
-
-        # Get most frequent OCR result
-        final_plate = majority_vote(ocr_buffers[track_id])
-
+        results = model(frame, conf=DETECTION_CONF, verbose=False)
+        detections = []
+        for result in results:
+            boxes = result.boxes.xyxy.cpu().numpy()
+            classes = result.boxes.cls.cpu().numpy()
+            confs = result.boxes.conf.cpu().numpy()
+            for box, cls, conf in zip(boxes, classes, confs):
+                if int(cls) == 0:
+                    x1, y1, x2, y2 = map(int, box)
+                    detections.append(([x1, y1, x2-x1, y2-y1], conf, 'plate'))
 
         # ======================================================
-        # DUPLICATE FILTER
+        # TRACKING USING DEEPSORT
         # ======================================================
+        tracks = tracker.update_tracks(detections, frame=frame)
+        for track in tracks:
+            if not track.is_confirmed():
+                continue
 
-        if final_plate and final_plate not in plate_memory:
+            track_id = track.track_id
+            l, t, w, h = map(int, track.to_ltrb())
+            
+            # Bounds check
+            l, t = max(0, l), max(0, t)
 
-            plate_memory.add(final_plate)
+            plate_crop = frame[t:t+h, l:l+w]
+            if plate_crop.size == 0:
+                continue
 
-            vehicle_count += 1
+            # ======================================================
+            # OCR EXTRACTION
+            # ======================================================
+            plate_text = read_plate(plate_crop)
+            if not plate_text:
+                continue
 
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            # ======================================================
+            # OCR MAJORITY VOTING BUFFER
+            # ======================================================
+            if track_id not in ocr_buffers:
+                ocr_buffers[track_id] = []
+            ocr_buffers[track_id].append(plate_text)
 
-            new_row = pd.DataFrame(
-                [[timestamp, final_plate, track_id]],
-                columns=["timestamp","plate_number","track_id"]
-            )
+            if len(ocr_buffers[track_id]) > OCR_BUFFER_SIZE:
+                ocr_buffers[track_id].pop(0)
 
-            new_row.to_csv(CSV_FILE, mode='a', header=False, index=False)
+            final_plate = majority_vote(ocr_buffers[track_id])
 
-            print("Detected Plate:", final_plate)
+            # ======================================================
+            # DUPLICATE FILTER
+            # ======================================================
+            if final_plate and final_plate not in plate_memory:
+                plate_memory.add(final_plate)
+                vehicle_count += 1
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
+                new_row = pd.DataFrame(
+                    [[timestamp, final_plate, track_id]],
+                    columns=["timestamp","plate_number","track_id"]
+                )
+                new_row.to_csv(CSV_FILE, mode='a', header=False, index=False)
+                print("Stream Detected Plate:", final_plate)
+
+            # ======================================================
+            # DRAW BOUNDING BOX
+            # ======================================================
+            cv2.rectangle(frame, (l, t), (l+w, t+h), (0, 255, 0), 2)
+            cv2.putText(frame, final_plate, (l, t-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
         # ======================================================
-        # DRAW BOUNDING BOX
+        # DISPLAY STATS & VIDEO
         # ======================================================
+        cv2.putText(frame, f"Vehicle Count: {vehicle_count}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
 
-        cv2.rectangle(frame,(l,t),(l+w,t+h),(0,255,0),2)
+        elapsed_time = time.time() - start_time
+        fps = frame_count / elapsed_time if elapsed_time > 0 else 0
+        cv2.putText(frame, f"FPS: {fps:.2f}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 3)
 
-        cv2.putText(
-            frame,
-            final_plate,
-            (l,t-10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0,255,0),
-            2
-        )
+        cv2.imshow("Advanced ANPR System - Live Stream", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-
-    # ======================================================
-    # DISPLAY VEHICLE COUNT
-    # ======================================================
-
-    cv2.putText(
-        frame,
-        f"Vehicle Count: {vehicle_count}",
-        (20,40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (0,0,255),
-        3
-    )
-
-
-    # ======================================================
-    # FPS DISPLAY
-    # ======================================================
-
-    elapsed_time = time.time() - start_time
-
-    fps = frame_count / elapsed_time
-
-    cv2.putText(
-        frame,
-        f"FPS: {fps:.2f}",
-        (20,80),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (255,0,0),
-        3
-    )
-
-
-    # ======================================================
-    # SHOW VIDEO WINDOW
-    # ======================================================
-
-    cv2.imshow("Advanced ANPR System", frame)
-
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-
-# ==========================================================
-# CLEANUP
-# ==========================================================
-
-cap.release()
-
-cv2.destroyAllWindows()
+    # ==========================================================
+    # CLEANUP
+    # ==========================================================
+    cap.release()
+    cv2.destroyAllWindows()
+'''
